@@ -51,6 +51,8 @@ struct iqs7211e_data {
     const struct device *dev;
     struct k_work motion_work;
     struct k_work_delayable click_work;
+    struct k_work_delayable hold_work; /* press&hold -> BTN_2 (torabo v2, see below) */
+    bool hold_active;                  /* BTN_2 currently held down */
     struct gpio_callback motion_cb;
     uint16_t product_number;
     bool init_complete;
@@ -632,7 +634,7 @@ static void iqs7211e_click_work_handler(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct iqs7211e_data *data = CONTAINER_OF(dwork, struct iqs7211e_data, click_work);
     const struct device *dev = data->dev;
-    
+
     if (data->pending_click_type == 1) {
         // Left click release
         LOG_DBG("Single tap - release");
@@ -643,6 +645,35 @@ static void iqs7211e_click_work_handler(struct k_work *work) {
         input_report_key(dev, INPUT_BTN_1, 0, true, K_FOREVER);
     }
     data->pending_click_type = 0;
+}
+
+/*
+ * Press & hold -> INPUT_BTN_2 (torabo-tsuki v2, DESIGN-trackpad-v2.md §4.4).
+ * A single finger held roughly still for IQS7211E_HOLD_MS emits BTN_2 press; the
+ * touch-end path (finger_count 0) emits BTN_2 release. The tp_keys processor maps
+ * BTN_2 to the configurable GST_HOLD binding (down/up follow). Robust to the
+ * sensor not re-reporting a stationary finger: the timer fires independently and
+ * only checks that a single finger is still down. Runs on the system work queue,
+ * SAME queue as motion_work, so the two never race. Nothing here fires unless a
+ * hold is genuinely detected, so tap/drag/scroll are unaffected (fail-safe).
+ */
+#define IQS7211E_HOLD_MS 350       /* touch duration to become a hold (> tap 200ms) */
+#define IQS7211E_HOLD_MOVE_MAX 60  /* max travel (sum|dx|+|dy|) before it's a move   */
+
+static void iqs7211e_hold_work_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct iqs7211e_data *data = CONTAINER_OF(dwork, struct iqs7211e_data, hold_work);
+    const struct device *dev = data->dev;
+    /* Fire only if one finger is still down and no click/drag is in progress. */
+    if (!data->previous_valid || data->finger_2_prev_valid || data->hold_active) {
+        return;
+    }
+    if (data->is_clicking || data->double_tap_hold) {
+        return;
+    }
+    LOG_DBG("Press & hold - BTN_2 press");
+    data->hold_active = true;
+    input_report_key(dev, INPUT_BTN_2, 1, true, K_FOREVER);
 }
 
 static int iqs7211e_interrupt_configure(const struct device *dev, gpio_flags_t flags) {
@@ -721,6 +752,8 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
             data->scroll_was_active = false;
             data->gesture_started_near_edge = iqs7211e_is_near_edge(data, finger_1_x, finger_1_y);
             data->scroller_axis_lock = IQS7211E_SCROLL_AXIS_NONE;
+            // Arm the press&hold timer for this single-finger touch (torabo v2).
+            k_work_reschedule(&data->hold_work, K_MSEC(IQS7211E_HOLD_MS));
         } else if (data->finger_2_prev_valid) {
             // Transitioning from two finger to one finger - reset position reference
             LOG_DBG("Transition from two finger to one finger - reset position");
@@ -738,6 +771,15 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
             // Normal single finger movement
             int16_t x = finger_1_x - data->previous_x;
             int16_t y = finger_1_y - data->previous_y;
+
+            // Too much travel before the hold fired => it's a move/drag, not a hold.
+            if (!data->hold_active) {
+                int16_t travel = abs(finger_1_x - data->tap_start_x) +
+                                 abs(finger_1_y - data->tap_start_y);
+                if (travel > IQS7211E_HOLD_MOVE_MAX) {
+                    k_work_cancel_delayable(&data->hold_work);
+                }
+            }
 
             if (cfg->scroller_mode) {
                 bool hwheel_zone = iqs7211e_is_hwheel_zone(data, finger_1_y);
@@ -779,6 +821,12 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
                 data->is_clicking = false;
                 input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
             }
+            // A second finger cancels/ends a single-finger press&hold (torabo v2).
+            k_work_cancel_delayable(&data->hold_work);
+            if (data->hold_active) {
+                data->hold_active = false;
+                input_report_key(dev, INPUT_BTN_2, 0, true, K_FOREVER);
+            }
         } else {
             // Two finger movement - scroll
             int16_t y_movement = (finger_1_y + finger_2_y) / 2 - (data->previous_y + data->finger_2_prev_y) / 2;
@@ -810,7 +858,14 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
         
     } else {
         // No fingers - handle touch end events
-        if (data->previous_valid || data->finger_2_prev_valid) {
+        // A pending or active press&hold ends here (torabo v2): cancel the timer and,
+        // if BTN_2 was held, release it. A completed hold is NOT also a tap.
+        k_work_cancel_delayable(&data->hold_work);
+        if (data->hold_active) {
+            LOG_DBG("Press & hold - BTN_2 release");
+            data->hold_active = false;
+            input_report_key(dev, INPUT_BTN_2, 0, true, K_FOREVER);
+        } else if (data->previous_valid || data->finger_2_prev_valid) {
             int64_t touch_duration = current_time - data->last_touch_time;
             bool ended_near_edge = false;
             bool tap_allowed;
@@ -824,7 +879,7 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
             }
 
             tap_allowed = !(data->gesture_started_near_edge || ended_near_edge);
-            
+
             if (data->finger_2_prev_valid) {
                 // Two finger tap - right click
                 if (touch_duration < 200) { // Quick tap
@@ -1038,6 +1093,7 @@ static int iqs7211e_init(const struct device *dev) {
     
     k_work_init(&data->motion_work, iqs7211e_motion_work_handler);
     k_work_init_delayable(&data->click_work, iqs7211e_click_work_handler);
+    k_work_init_delayable(&data->hold_work, iqs7211e_hold_work_handler);
 #if defined(CONFIG_IQS7211E_SCROLLER_INERTIA) && CONFIG_IQS7211E_SCROLLER_INERTIA
     k_work_init_delayable(&data->inertia_work, iqs7211e_inertia_work_handler);
 #endif

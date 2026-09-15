@@ -1113,8 +1113,8 @@ static int iqs7211e_init(const struct device *dev) {
             LOG_ERR("Power pin set failed: %d", ret);
             return ret;
         }
-        
-        k_sleep(K_MSEC(10));
+
+        k_sleep(K_MSEC(300));
     }
 #endif
     
